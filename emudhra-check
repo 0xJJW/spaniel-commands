@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# eMudhra checklist for Macs: checks which terminal tools still trust the distrusted eMudhra roots.
+# Usage: curl -fsSL https://spaniel.sh/emudhra-check | bash
+# Each tool fetches a normal site and the bad test site; exit codes decide, not error text.
+# Exits 2 if any tool NEEDS FIX, 1 if the check couldn't run at all, 0 otherwise.
+# EMUDHRA_DEBUG=1 keeps each tool's own error output, for reporting a "can't tell".
+# Nothing runs until main is called on the last line, so a partly downloaded script does nothing.
+BAD=https://dv-g3b-emudhra.we-have-a-problem.com/
+GOOD=https://emudhra.we-have-a-problem.com/
+POST=https://www.spaniel.dev/post/emudhra-certificate-checklist
+# Run each tool inside the throwaway folder, so no project's files or config in the current folder are loaded
+# Its error output goes to fd 3: the terminal with EMUDHRA_DEBUG=1, /dev/null otherwise (set up in main)
+fetches() {
+  URL=$1; shift
+  [ -n "${EMUDHRA_DEBUG:-}" ] && echo "--- $name fetching $URL" >&2
+  ( cd "$T" && export URL && "$@" ) >/dev/null 2>&3 </dev/null
+}
+# Which build of a tool is being tested: the one the shell resolves on PATH, and its version
+version() {
+  case $1 in
+    osascript) sw_vers -productVersion ;;
+    curl | deno) "$1" --version | head -n1 | awk '{print $2}' ;;
+    python3) python3 --version | awk '{print $2}' ;;
+    *) "$1" --version | awk 'NR == 1 && NF == 1' ;;  # one word on one line, or it isn't a version
+  esac </dev/null 2>&3
+}
+# The Mac's own certificate list (Safari, pnpm 12): load the page with Foundation, with no URL cache on disk
+macos_fetch() {
+  osascript -l JavaScript -e 'ObjC.import("Cocoa")
+    function run (argv) {
+      $.NSURLCache.setSharedURLCache($.NSURLCache.alloc.initWithMemoryCapacityDiskCapacityDiskPath(0, 0, $()))
+      const req = $.NSURLRequest.requestWithURLCachePolicyTimeoutInterval($.NSURL.URLWithString(argv[0]), $.NSURLRequestReloadIgnoringLocalCacheData, 15)
+      if ($.NSURLConnection.sendSynchronousRequestReturningResponseError(req, null, Ref()).isNil()) throw "failed"
+    }' "$URL"
+}
+# pnpm 10/11: a throwaway pnpmfile fetches inside pnpm's own Node, exiting 42 if it connected, 43 if not
+# A tool can leave the reason it couldn't run in "why", which check shows instead of the generic message
+pnpm_fetch() {
+  v=$(pnpm --version 2>&3 | cut -d. -f1)
+  case $v in
+    '' | *[!0-9]*)  # pnpm's launcher does "exec node", so with no node, pnpm can't start at all
+      command -v node >/dev/null 2>&1 || echo "pnpm needs node to run, and node isn't installed" > "$T/why"
+      return 1 ;;
+  esac
+  if [ "$v" -ge 12 ]; then macos_fetch; return; fi
+  pnpm install --lockfile-only --ignore-workspace >/dev/null 2>&3; [ $? -eq 42 ]
+}
+# pip connects with its own certificate list (or PIP_CERT): ask pip to build its session and fetch
+# (a non-2xx answer doesn't raise, so like the other tools, connecting is what counts; no retries, pip's
+# default of 5 with backoff turns one refused handshake into a 10-second wait)
+pip_fetch() {
+  python3 -c 'import os
+from pip._internal.commands import create_command
+c = create_command("download"); o, _ = c.parse_args(["--no-cache-dir", "--retries", "0"])
+c._build_session(o).get(os.environ["URL"], timeout=15)'
+}
+# python3's urlopen raises HTTPError for a non-2xx answer, which still means the certificate was accepted
+python_fetch() {
+  python3 -c 'import os, urllib.error, urllib.request
+try: urllib.request.urlopen(os.environ["URL"], timeout=15)
+except urllib.error.HTTPError: pass'
+}
+check() {
+  name=$1; bin=$2; shift 2
+  # /usr/bin/python3 is only a stub until Apple's command line tools are installed
+  if ! command -v "$bin" >/dev/null 2>&1 ||
+     { [ "$(command -v "$bin")" = /usr/bin/python3 ] && ! xcode-select -p >/dev/null 2>&1; }; then
+    printf '%-8s not installed\n' "$name"; return
+  fi
+  v=$(version "$bin"); build="$(command -v "$bin")${v:+ $v}"
+  [ "$bin" = osascript ] && build="macOS $v"
+  # pip is a module inside python3: without it there's nothing to test
+  if [ "$name" = pip ] && ! ( cd "$T" && python3 -c 'import pip' ) >/dev/null 2>&3 </dev/null; then
+    printf '%-8s not installed (no pip in %s)\n' "$name" "$build"; return
+  fi
+  rm -f -- "$T/why"
+  if fetches "$BAD" "$@"; then r='NEEDS FIX'; FIX=1
+  elif fetches "$GOOD" "$@"; then r=ok
+  elif [ -s "$T/why" ]; then r="can't tell ($build: $(cat "$T/why"))"; build=
+  else r="can't tell ($build: couldn't run the check; EMUDHRA_DEBUG=1 shows why)"; build=; fi
+  printf '%-8s %s%s\n' "$name" "$r" "${build:+ ($build)}"
+}
+main() {
+  # A down test site would read as ok, so make sure both sites answer first (-k: any certificate will do)
+  if ! curl -sk -o /dev/null --connect-timeout 10 --max-time 15 "$BAD" ||
+     ! curl -sk -o /dev/null --connect-timeout 10 --max-time 15 "$GOOD"; then
+    echo "Unable to check: couldn't reach the test site. You're offline, or the site is down. Nothing was checked." >&2
+    exit 1
+  fi
+  # Work only inside a new private folder, removed however the script ends; never in the current folder
+  T=$(mktemp -d "${TMPDIR:-/tmp}/emudhra-check.XXXXXX") && [ -n "$T" ] && [ -d "$T" ] ||
+    { echo "Unable to check: couldn't create a temporary folder. Nothing was checked." >&2; exit 1; }
+  trap 'rm -rf -- "$T"' EXIT
+  trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+  if [ -n "${EMUDHRA_DEBUG:-}" ]; then exec 3>&2; else exec 3>/dev/null; fi
+  FIX=
+  echo '{"name":"emudhra-check","private":true}' > "$T/package.json"
+  cat > "$T/.pnpmfile.cjs" <<'JS'
+const done = fetch(process.env.URL, { signal: AbortSignal.timeout(15000) }).then(() => process.exit(42), () => process.exit(43))
+module.exports = { hooks: { async preResolution () { await done } } }
+JS
+  echo "Which tools still trust the distrusted eMudhra roots? (ok / NEEDS FIX / not installed / can't tell) $POST"
+  check macos   osascript macos_fetch
+  check curl    curl    sh -c 'curl -sS -o /dev/null --connect-timeout 10 --max-time 15 "$URL"'
+  check node    node    node -e 'fetch(process.env.URL, { signal: AbortSignal.timeout(15000) }).catch(() => process.exit(1))'
+  check pnpm    pnpm    pnpm_fetch
+  check python3 python3 python_fetch
+  check pip     python3 pip_fetch
+  check deno    deno    env DENO_DIR="$T/deno" deno eval 'await fetch(Deno.env.get("URL"), { signal: AbortSignal.timeout(15000) })'
+  check bun     bun     bun -e 'await fetch(process.env.URL, { signal: AbortSignal.timeout(15000) })'
+  # uv fails at the test site either way, so compare its version: fixed from 0.13.5
+  v=$(command -v uv >/dev/null && uv --version </dev/null 2>&3 | awk '{print $2}')
+  if [ -z "$v" ]; then r='not installed'
+  elif [ "$(printf '%s\n' 0.13.5 "$v" | sort -V | head -n1)" = 0.13.5 ]; then r="ok ($(command -v uv) $v)"
+  else r="NEEDS FIX ($(command -v uv) $v)"; FIX=1; fi
+  printf '%-8s %s\n' uv "$r"
+  # Homebrew: its ca-certificates is fixed from 2026-09-25_1; without it, nothing in Homebrew uses an old list
+  # (brew list prints every installed version on one line; the newest is the one in use)
+  if ! command -v brew >/dev/null 2>&1; then r='not installed'
+  else
+    v=$(brew list --versions ca-certificates </dev/null 2>&3 | tr ' ' '\n' | tail -n +2 | sort -V | tail -n1)
+    if [ -z "$v" ]; then r='ok (no Homebrew ca-certificates)'
+    elif [[ "$v" > 2026-09-25 ]]; then r="ok (ca-certificates $v)"
+    else r="NEEDS FIX (ca-certificates $v)"; FIX=1; fi
+  fi
+  printf '%-8s %s\n' brew "$r"
+  if [ -n "$FIX" ]; then exit 2; fi
+}
+main
