@@ -7,7 +7,7 @@
 # Nothing runs until main is called on the last line, so a partly downloaded script does nothing.
 BAD=https://dv-g3b-emudhra.we-have-a-problem.com/
 GOOD=https://emudhra.we-have-a-problem.com/
-POST=https://www.spaniel.dev/post/emudhra-certificate-checklist
+POST=https://www.spaniel.dev/posts/emudhra-certificate-checklist
 # Run each tool inside the throwaway folder, so no project's files or config in the current folder are loaded
 # Its error output goes to fd 3: the terminal with EMUDHRA_DEBUG=1, /dev/null otherwise (set up in main)
 fetches() {
